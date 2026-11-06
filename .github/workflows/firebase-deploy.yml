@@ -14,15 +14,16 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install & Build
-        run: |
-          npm install
-          npm run build
+      - name: Install Dependencies
+        run: npm install
 
-      - name: Deploy to Firebase
-        uses: FirebaseExtended/action-hosting-deploy@v0
+      - name: Build Project
+        run: npm run build
+
+      - name: Deploy to Firebase Hosting
+        uses: w9jds/firebase-action@master
         with:
-          repoToken: "${{ secrets.GITHUB_TOKEN }}"
-          firebaseServiceAccount: "${{ secrets.FIREBASE_SERVICE_ACCOUNT_BIBER_FOOD }}"
-          channelId: live
-          projectId: biber-food
+          args: deploy --only hosting
+        env:
+          GCP_SA_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_BIBER_FOOD }}
+          PROJECT_ID: biber-food
