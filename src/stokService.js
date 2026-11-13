@@ -25,7 +25,7 @@ async function tulis(fn) {
 }
 
 // Penjualan: cek stok cukup, simpan transaksi, kurangi stok (semua berhasil atau semua gagal)
-export async function simpanPenjualan(keranjang, bayar) {
+export async function simpanPenjualan(keranjang, bayar, kasir = 'Operator') {
   const total = keranjang.reduce((s, i) => s + (i.sell ?? i.hargaJual ?? 0) * i.qty, 0)
   const trxRef = doc(collection(db, 'transaksi'))
   const refs = keranjang.map(i => doc(db, 'barang', i.id))
@@ -41,6 +41,7 @@ export async function simpanPenjualan(keranjang, bayar) {
     tx.set(trxRef, {
       waktu: serverTimestamp(),
       metode: 'tunai',
+      kasir: kasir || 'Operator',
       total,
       bayar,
       kembalian: bayar - total,
@@ -57,22 +58,28 @@ export async function simpanPenjualan(keranjang, bayar) {
 }
 
 // Barang masuk: tambah stok + catat riwayat
-export async function simpanBarangMasuk(kode, qty, hargaBeli) {
+export async function simpanBarangMasuk(kode, qty, hargaBeli, namaBarang = '') {
   await tulis(async tx => {
     tx.update(doc(db, 'barang', kode), { stok: increment(qty) })
     tx.set(doc(collection(db, 'pergerakanStok')), {
-      kode, jenis: 'masuk', qty, hargaBeli, waktu: serverTimestamp(),
+      kode,
+      nama: namaBarang,
+      jenis: 'masuk',
+      qty,
+      hargaBeli,
+      waktu: serverTimestamp(),
     })
   })
 }
 
-// Stok opname: daftar = [{ kode, stokSistem, stokFisik }]
+// Stok opname: daftar = [{ kode, nama, stokSistem, stokFisik }]
 export async function simpanOpname(daftar) {
   await tulis(async tx => {
     for (const d of daftar) {
       tx.update(doc(db, 'barang', d.kode), { stok: d.stokFisik })
       tx.set(doc(collection(db, 'pergerakanStok')), {
         kode: d.kode,
+        nama: d.nama || '',
         jenis: 'opname',
         qty: d.stokFisik - d.stokSistem,
         stokSistem: d.stokSistem,

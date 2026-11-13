@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { collection, getDocs, orderBy, query } from 'firebase/firestore'
+import { collection, getDocs, onSnapshot, orderBy, query } from 'firebase/firestore'
 import { db } from './firebase'
 import { getAuth, onAuthStateChanged, signOut } from 'firebase/auth'
 import Login from './Login'
@@ -31,6 +31,8 @@ import {
   Menu,
   UserRound,
   ReceiptText,
+  Download,
+  Eye,
 } from 'lucide-react'
 import './style.css'
 
@@ -39,7 +41,71 @@ const format = n =>
     style: 'currency',
     currency: 'IDR',
     maximumFractionDigits: 0,
-  }).format(n)
+  }).format(n || 0)
+
+const parseDate = waktu => {
+  if (!waktu) return new Date()
+  if (typeof waktu.toDate === 'function') return waktu.toDate()
+  if (waktu.seconds) return new Date(waktu.seconds * 1000)
+  if (waktu instanceof Date) return waktu
+  const d = new Date(waktu)
+  return isNaN(d.getTime()) ? new Date() : d
+}
+
+const isSameDay = (d1, d2) => {
+  return (
+    d1.getFullYear() === d2.getFullYear() &&
+    d1.getMonth() === d2.getMonth() &&
+    d1.getDate() === d2.getDate()
+  )
+}
+
+const formatCompact = n => {
+  if (!n || isNaN(n)) return '0'
+  if (n >= 1000000) return (n / 1000000).toFixed(1).replace('.0', '').replace('.', ',') + 'jt'
+  if (n >= 1000) return Math.round(n / 1000) + 'rb'
+  return String(Math.round(n))
+}
+
+const formatRelativeTime = date => {
+  if (!date) return ''
+  const now = new Date()
+  const diffMs = now.getTime() - date.getTime()
+  const diffSecs = Math.max(0, Math.floor(diffMs / 1000))
+  const diffMins = Math.floor(diffSecs / 60)
+  const diffHours = Math.floor(diffMins / 60)
+  const diffDays = Math.floor(diffHours / 24)
+
+  if (diffSecs < 60) return 'Baru saja'
+  if (diffMins < 60) return `${diffMins} menit lalu`
+  if (diffHours < 24) return `${diffHours} jam lalu`
+  if (diffDays === 1) return 'Kemarin'
+  if (diffDays < 7) return `${diffDays} hari lalu`
+  return new Intl.DateTimeFormat('id-ID', { day: 'numeric', month: 'short' }).format(date)
+}
+
+const getTransactionMetrics = (t, productMap) => {
+  const omzet = Number(t.total || 0)
+  let hpp = 0
+  let units = 0
+  if (Array.isArray(t.items)) {
+    t.items.forEach(item => {
+      const q = Number(item.qty || 0)
+      units += q
+      const p = productMap.get(String(item.kode))
+      const modal = Number(item.hargaModal ?? p?.buy ?? p?.hargaModal ?? 0)
+      hpp += q * modal
+    })
+  }
+  const profit = omzet - hpp
+  return {
+    omzet,
+    hpp,
+    profit,
+    units,
+    kinds: Array.isArray(t.items) ? t.items.length : 0,
+  }
+}
 
 const nav = [
   { id: 'dashboard', text: 'Dashboard', icon: LayoutDashboard },
@@ -80,7 +146,10 @@ function App() {
     [toast, setToast] = useState(''),
     [loading, setLoading] = useState(true),
     [user, setUser] = useState(null),
-    [authReady, setAuthReady] = useState(false)
+    [authReady, setAuthReady] = useState(false),
+    [transactions, setTransactions] = useState([]),
+    [movements, setMovements] = useState([]),
+    [trxLoading, setTrxLoading] = useState(true)
 
   useEffect(() => {
     const unsub = onAuthStateChanged(getAuth(), u => {
@@ -128,6 +197,49 @@ function App() {
     fetchBarang()
   }, [user])
 
+  // Real-time listener untuk transaksi dan pergerakan stok dari Firestore
+  useEffect(() => {
+    if (!user || !db) {
+      setTransactions([])
+      setMovements([])
+      setTrxLoading(false)
+      return
+    }
+
+    setTrxLoading(true)
+
+    const unsubTrx = onSnapshot(
+      collection(db, 'transaksi'),
+      snap => {
+        const list = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+        list.sort((a, b) => parseDate(b.waktu).getTime() - parseDate(a.waktu).getTime())
+        setTransactions(list)
+        setTrxLoading(false)
+      },
+      err => {
+        console.error('Error listening to transaksi:', err)
+        setTrxLoading(false)
+      }
+    )
+
+    const unsubMov = onSnapshot(
+      collection(db, 'pergerakanStok'),
+      snap => {
+        const list = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+        list.sort((a, b) => parseDate(b.waktu).getTime() - parseDate(a.waktu).getTime())
+        setMovements(list)
+      },
+      err => {
+        console.error('Error listening to pergerakanStok:', err)
+      }
+    )
+
+    return () => {
+      unsubTrx()
+      unsubMov()
+    }
+  }, [user])
+
   const notify = t => {
     setToast(t)
     setTimeout(() => setToast(''), 3500)
@@ -165,7 +277,7 @@ function App() {
   const complete = async paid => {
     if (!cart.length) return notify('Pilih barang terlebih dahulu')
     try {
-      await simpanPenjualan(cart, paid)
+      await simpanPenjualan(cart, paid, role || user?.displayName || 'Operator')
     } catch (err) {
       console.error('Gagal menyimpan transaksi:', err)
       return notify('Gagal menyimpan transaksi: ' + err.message)
@@ -182,6 +294,11 @@ function App() {
     setCart([])
     notify('Transaksi berhasil disimpan dan stok diperbarui')
   }
+
+  const todayTrxCount = useMemo(() => {
+    const now = new Date()
+    return transactions.filter(t => isSameDay(parseDate(t.waktu), now)).length
+  }, [transactions])
 
   if (!authReady) return <div style={{ padding: 24 }}>Memuat...</div>
   if (!user) return <Login />
@@ -253,7 +370,13 @@ function App() {
           </div>
           <div className="header-actions">
             <button className="date">
-              Kamis, 5 November 2026 <ChevronDown size={15} />
+              {new Intl.DateTimeFormat('id-ID', {
+                weekday: 'long',
+                day: 'numeric',
+                month: 'long',
+                year: 'numeric',
+              }).format(new Date())}{' '}
+              <ChevronDown size={15} />
             </button>
             <button className="bell">
               <Bell size={20} />
@@ -272,8 +395,18 @@ function App() {
             </select>
           </div>
         </header>
-        {loading && <div style={{ padding: '16px 28px', color: '#666', fontSize: 14 }}>Memuat data produk...</div>}
-        {view === 'dashboard' && <Dashboard products={products} setView={setView} />}
+        {(loading || trxLoading) && (
+          <div style={{ padding: '16px 28px', color: '#666', fontSize: 14 }}>Memuat data...</div>
+        )}
+        {view === 'dashboard' && (
+          <Dashboard
+            products={products}
+            transactions={transactions}
+            movements={movements}
+            loading={trxLoading}
+            setView={setView}
+          />
+        )}
         {view === 'pos' && (
           <POS
             products={products}
@@ -285,12 +418,20 @@ function App() {
             setCart={setCart}
             total={total}
             complete={complete}
+            todayTrxCount={todayTrxCount}
           />
         )}
         {view === 'products' && <Products products={products} setProducts={setProducts} notify={notify} />}
         {view === 'incoming' && <Incoming products={products} setProducts={setProducts} notify={notify} />}
         {view === 'opname' && <Opname products={products} setProducts={setProducts} notify={notify} />}
-        {view === 'reports' && <Reports />}
+        {view === 'reports' && (
+          <Reports
+            products={products}
+            transactions={transactions}
+            loading={trxLoading}
+            notify={notify}
+          />
+        )}
       </main>
       {toast && (
         <div className="toast" style={{ zIndex: 9999 }}>
@@ -302,19 +443,232 @@ function App() {
   )
 }
 
-function Dashboard({ products, setView }) {
-  const low = products.filter(p => (p.stock ?? p.stok ?? 0) <= (p.min ?? p.batasMinimal ?? 0))
+function Dashboard({ products, transactions, movements, loading, setView }) {
+  const productMap = useMemo(() => {
+    const map = new Map()
+    products.forEach(p => {
+      map.set(String(p.id), p)
+      if (p.kode) map.set(String(p.kode), p)
+    })
+    return map
+  }, [products])
+
+  const low = useMemo(
+    () => products.filter(p => (p.stock ?? p.stok ?? 0) <= (p.min ?? p.batasMinimal ?? 0)),
+    [products]
+  )
+
+  const today = useMemo(() => new Date(), [])
+  const yesterday = useMemo(() => {
+    const d = new Date()
+    d.setDate(d.getDate() - 1)
+    return d
+  }, [])
+
+  const todayTrx = useMemo(() => {
+    return transactions.filter(t => isSameDay(parseDate(t.waktu), today))
+  }, [transactions, today])
+
+  const yesterdayTrx = useMemo(() => {
+    return transactions.filter(t => isSameDay(parseDate(t.waktu), yesterday))
+  }, [transactions, yesterday])
+
+  const todayMetrics = useMemo(() => {
+    let omzet = 0
+    let hpp = 0
+    todayTrx.forEach(t => {
+      const m = getTransactionMetrics(t, productMap)
+      omzet += m.omzet
+      hpp += m.hpp
+    })
+    const profit = omzet - hpp
+    const margin = omzet > 0 ? (profit / omzet) * 100 : 0
+    return { omzet, hpp, profit, margin, count: todayTrx.length }
+  }, [todayTrx, productMap])
+
+  const yesterdayMetrics = useMemo(() => {
+    let omzet = 0
+    yesterdayTrx.forEach(t => {
+      omzet += Number(t.total || 0)
+    })
+    return { omzet, count: yesterdayTrx.length }
+  }, [yesterdayTrx])
+
+  const omzetDelta = useMemo(() => {
+    if (yesterdayMetrics.omzet > 0) {
+      const diff = ((todayMetrics.omzet - yesterdayMetrics.omzet) / yesterdayMetrics.omzet) * 100
+      return `${diff >= 0 ? '+' : ''}${diff.toFixed(1).replace('.', ',')}% vs kemarin`
+    }
+    if (todayMetrics.count > 0) return `${todayMetrics.count} transaksi hari ini`
+    return '0 transaksi hari ini'
+  }, [todayMetrics, yesterdayMetrics])
+
+  const profitDelta = useMemo(() => {
+    if (todayMetrics.omzet > 0) {
+      return `${todayMetrics.margin.toFixed(1).replace('.', ',')}% margin`
+    }
+    return '0% margin'
+  }, [todayMetrics])
+
+  const trxDelta = useMemo(() => {
+    const avg = todayMetrics.count > 0 ? Math.round(todayMetrics.omzet / todayMetrics.count) : 0
+    return `Rata-rata ${format(avg)}`
+  }, [todayMetrics])
+
+  // 7 hari terakhir untuk grafik batang ringkasan penjualan
+  const last7Days = useMemo(() => {
+    const dayNames = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab']
+    const days = []
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date()
+      d.setDate(d.getDate() - i)
+      d.setHours(0, 0, 0, 0)
+      const endD = new Date(d)
+      endD.setHours(23, 59, 59, 999)
+
+      const dayTrx = transactions.filter(t => {
+        const td = parseDate(t.waktu)
+        return td >= d && td <= endD
+      })
+      const dayOmzet = dayTrx.reduce((s, t) => s + Number(t.total || 0), 0)
+      days.push({
+        label: dayNames[d.getDay()],
+        formattedDate: `${d.getDate()}/${d.getMonth() + 1}`,
+        omzet: dayOmzet,
+        count: dayTrx.length,
+        isToday: i === 0,
+      })
+    }
+    return days
+  }, [transactions])
+
+  const total7Days = useMemo(() => last7Days.reduce((s, d) => s + d.omzet, 0), [last7Days])
+
+  const prev7Days = useMemo(() => {
+    const start = new Date()
+    start.setDate(start.getDate() - 13)
+    start.setHours(0, 0, 0, 0)
+    const end = new Date()
+    end.setDate(end.getDate() - 7)
+    end.setHours(23, 59, 59, 999)
+    return transactions
+      .filter(t => {
+        const d = parseDate(t.waktu)
+        return d >= start && d <= end
+      })
+      .reduce((s, t) => s + Number(t.total || 0), 0)
+  }, [transactions])
+
+  const max7Days = useMemo(() => {
+    const m = Math.max(...last7Days.map(d => d.omzet), 0)
+    return m > 0 ? m : 1000000
+  }, [last7Days])
+
+  // Produk terlaris dari data transaksi riil
+  const topProducts = useMemo(() => {
+    const map = new Map()
+    transactions.forEach(t => {
+      if (Array.isArray(t.items)) {
+        t.items.forEach(item => {
+          const id = String(item.kode || item.id || item.nama)
+          const existing = map.get(id) || {
+            id,
+            name: item.nama || 'Barang',
+            qty: 0,
+            revenue: 0,
+          }
+          existing.qty += Number(item.qty || 0)
+          existing.revenue += Number(item.qty || 0) * Number(item.hargaJual || 0)
+          map.set(id, existing)
+        })
+      }
+    })
+    return Array.from(map.values())
+      .sort((a, b) => b.qty - a.qty)
+      .slice(0, 4)
+      .map(item => {
+        const p = productMap.get(item.id) || products.find(prod => (prod.name || prod.nama) === item.name)
+        return {
+          ...item,
+          name: p?.name || p?.nama || item.name,
+          color: p?.color || '#f8bd49',
+          icon: p?.icon || '🍱',
+        }
+      })
+  }, [transactions, productMap, products])
+
+  // Riwayat aktivitas riil dari transaksi & pergerakan stok
+  const activities = useMemo(() => {
+    const list = []
+    transactions.forEach(t => {
+      list.push({
+        id: t.id,
+        type: 'trx',
+        icon: '✓',
+        iconClass: 'i0',
+        title: `Transaksi #${t.id.slice(-6).toUpperCase()} berhasil`,
+        sub: format(t.total || 0),
+        date: parseDate(t.waktu),
+      })
+    })
+    movements.forEach(m => {
+      const date = parseDate(m.waktu)
+      const p = productMap.get(String(m.kode))
+      const prodName = m.nama || p?.name || p?.nama || m.kode || 'Barang'
+      if (m.jenis === 'masuk') {
+        list.push({
+          id: m.id || `${m.kode}-${date.getTime()}`,
+          type: 'masuk',
+          icon: '+',
+          iconClass: 'i1',
+          title: `Stok masuk: +${m.qty} ${prodName}`,
+          sub: m.hargaBeli ? format(m.hargaBeli) + '/unit' : '',
+          date,
+        })
+      } else if (m.jenis === 'opname') {
+        const diff = Number(m.qty || 0)
+        list.push({
+          id: m.id || `${m.kode}-${date.getTime()}`,
+          type: 'opname',
+          icon: '◉',
+          iconClass: 'i2',
+          title: `Stok opname: ${prodName}`,
+          sub: `Selisih ${diff >= 0 ? '+' : ''}${diff}`,
+          date,
+        })
+      }
+    })
+    return list.sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 4)
+  }, [transactions, movements, productMap])
+
   return (
     <section className="content">
       <div className="stat-grid">
-        <Stat icon={<WalletCards />} label="Omzet hari ini" value="Rp 1.248.000" delta="12,5%" />
-        <Stat icon={<TrendingUp />} label="Keuntungan hari ini" value="Rp 482.600" delta="8,2%" tone="purple" />
-        <Stat icon={<ReceiptText />} label="Total transaksi" value="86 transaksi" delta="18 transaksi" tone="blue" />
+        <Stat
+          icon={<WalletCards />}
+          label="Omzet hari ini"
+          value={format(todayMetrics.omzet)}
+          delta={omzetDelta}
+        />
+        <Stat
+          icon={<TrendingUp />}
+          label="Keuntungan hari ini"
+          value={format(todayMetrics.profit)}
+          delta={profitDelta}
+          tone="purple"
+        />
+        <Stat
+          icon={<ReceiptText />}
+          label="Total transaksi"
+          value={`${todayMetrics.count} transaksi`}
+          delta={trxDelta}
+          tone="blue"
+        />
         <Stat
           icon={<PackageSearch />}
           label="Stok menipis"
           value={`${low.length} barang`}
-          delta="Perlu diperiksa"
+          delta={low.length ? 'Perlu diperiksa' : 'Stok aman'}
           tone="orange"
         />
       </div>
@@ -331,24 +685,40 @@ function Dashboard({ products, setView }) {
           </div>
           <div className="chart">
             <div className="axis">
-              <span>1,5jt</span>
-              <span>1jt</span>
-              <span>500rb</span>
+              <span>{formatCompact(max7Days)}</span>
+              <span>{formatCompact(max7Days * 0.66)}</span>
+              <span>{formatCompact(max7Days * 0.33)}</span>
               <span>0</span>
             </div>
             <div className="bars">
-              {[45, 66, 54, 81, 64, 91, 78].map((h, i) => (
-                <div className="barcol" key={i}>
-                  <div style={{ height: h + '%' }} className={i === 5 ? 'hot' : ''} />
-                  <small>{['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'][i]}</small>
-                </div>
-              ))}
+              {last7Days.map((d, i) => {
+                const pct =
+                  max7Days > 0 && d.omzet > 0
+                    ? Math.max(6, Math.min(100, Math.round((d.omzet / max7Days) * 100)))
+                    : 0
+                return (
+                  <div
+                    className="barcol"
+                    key={i}
+                    title={`${d.label} (${d.formattedDate}): ${format(d.omzet)} (${d.count} transaksi)`}
+                  >
+                    <div
+                      style={{ height: (pct || 4) + '%', opacity: pct ? 1 : 0.25 }}
+                      className={d.isToday ? 'hot' : ''}
+                    />
+                    <small>{d.label}</small>
+                  </div>
+                )
+              })}
             </div>
           </div>
           <div className="chart-total">
-            <b>Rp 8.624.000</b>
+            <b>{format(total7Days)}</b>
             <span>
-              <ArrowUpRight size={15} /> +14,8% dari minggu lalu
+              <ArrowUpRight size={15} />{' '}
+              {prev7Days > 0
+                ? `${(((total7Days - prev7Days) / prev7Days) * 100).toFixed(1).replace('.', ',')}% dari minggu lalu`
+                : `${total7Days > 0 ? 'Total penjualan 7 hari terakhir' : 'Belum ada transaksi minggu ini'}`}
             </span>
           </div>
         </div>
@@ -358,21 +728,27 @@ function Dashboard({ products, setView }) {
               <h3>Produk terlaris</h3>
               <p>Berdasarkan jumlah terjual</p>
             </div>
-            <button className="link">Lihat semua</button>
+            <button className="link" onClick={() => setView('products')}>Lihat semua</button>
           </div>
-          {products.slice(0, 4).map((p, i) => (
-            <div className="rank" key={p.id}>
-              <strong>{i + 1}</strong>
-              <div className="prod-icon" style={{ background: p.color }}>
-                {p.icon}
-              </div>
-              <div>
-                <b>{p.name || p.nama}</b>
-                <span>{[42, 38, 31, 27][i]} terjual</span>
-              </div>
-              <em>{format((p.sell ?? p.hargaJual ?? 0) * [42, 38, 31, 27][i])}</em>
+          {topProducts.length === 0 ? (
+            <div style={{ padding: '35px 10px', textAlign: 'center', color: '#9ba39d', fontSize: 12 }}>
+              Belum ada produk terjual
             </div>
-          ))}
+          ) : (
+            topProducts.map((p, i) => (
+              <div className="rank" key={p.id || i}>
+                <strong>{i + 1}</strong>
+                <div className="prod-icon" style={{ background: p.color }}>
+                  {p.icon}
+                </div>
+                <div>
+                  <b>{p.name}</b>
+                  <span>{p.qty} terjual</span>
+                </div>
+                <em>{format(p.revenue)}</em>
+              </div>
+            ))
+          )}
         </div>
       </div>
       <div className="bottom-grid">
@@ -388,32 +764,42 @@ function Dashboard({ products, setView }) {
               Kelola stok
             </button>
           </div>
-          {low.map(p => (
-            <div className="low-item" key={p.id}>
-              <div className="prod-icon" style={{ background: p.color }}>
-                {p.icon}
-              </div>
-              <b>{p.name || p.nama}</b>
-              <span>
-                Sisa <strong>{p.stock ?? p.stok ?? 0} {p.unit || 'pcs'}</strong> · Min.{' '}
-                {p.min ?? p.batasMinimal ?? 0}
-              </span>
-              <AlertTriangle size={19} />
+          {low.length === 0 ? (
+            <div style={{ padding: '30px 10px', textAlign: 'center', color: '#367d59', fontSize: 12 }}>
+              Semua stok barang dalam batas aman ✓
             </div>
-          ))}
+          ) : (
+            low.slice(0, 4).map(p => (
+              <div className="low-item" key={p.id}>
+                <div className="prod-icon" style={{ background: p.color }}>
+                  {p.icon}
+                </div>
+                <b>{p.name || p.nama}</b>
+                <span>
+                  Sisa <strong>{p.stock ?? p.stok ?? 0} {p.unit || 'pcs'}</strong> · Min.{' '}
+                  {p.min ?? p.batasMinimal ?? 0}
+                </span>
+                <AlertTriangle size={19} />
+              </div>
+            ))
+          )}
         </div>
         <div className="card activity">
           <h3>Aktivitas terbaru</h3>
-          {['Transaksi #TRX-20261105-086 berhasil', 'Stok masuk: 24 Aqua Botol', 'Stok opname telah diselesaikan'].map(
-            (x, i) => (
-              <div className="activity-row" key={x}>
-                <div className={'activity-icon i' + i}>{i === 0 ? '✓' : i === 1 ? '+' : '◉'}</div>
+          {activities.length === 0 ? (
+            <div style={{ padding: '30px 10px', textAlign: 'center', color: '#9ba39d', fontSize: 12 }}>
+              Belum ada aktivitas tercatat
+            </div>
+          ) : (
+            activities.map(x => (
+              <div className="activity-row" key={x.id}>
+                <div className={'activity-icon ' + x.iconClass}>{x.icon}</div>
                 <div>
-                  <b>{x}</b>
-                  <span>{['2 menit lalu', '38 menit lalu', '1 jam lalu'][i]}</span>
+                  <b>{x.title}</b>
+                  <span>{formatRelativeTime(x.date)} {x.sub && `· ${x.sub}`}</span>
                 </div>
               </div>
-            )
+            ))
           )}
         </div>
       </div>
@@ -436,7 +822,7 @@ function Stat({ icon, label, value, delta, tone = '' }) {
   )
 }
 
-function POS({ products, cart, search, setSearch, addCart, changeQty, setCart, total, complete }) {
+function POS({ products, cart, search, setSearch, addCart, changeQty, setCart, total, complete, todayTrxCount = 0 }) {
   const [paid, setPaid] = useState(50000),
     [cat, setCat] = useState('Semua')
 
@@ -497,7 +883,7 @@ function POS({ products, cart, search, setSearch, addCart, changeQty, setCart, t
         <div className="checkout-head">
           <div>
             <h2>Pesanan baru</h2>
-            <p>#{String(87).padStart(4, '0')} · Hari ini</p>
+            <p>#{String(todayTrxCount + 1).padStart(4, '0')} · Hari ini</p>
           </div>
           <button onClick={() => setCart([])} className="clear">
             <Trash2 size={17} /> Kosongkan
@@ -742,7 +1128,7 @@ function Incoming({ products, setProducts, notify }) {
     if (!(Number(qty) > 0)) return notify('Jumlah masuk harus lebih dari 0')
     try {
       const harga = hargaBeli === '' ? p.buy ?? p.hargaModal ?? 0 : Number(hargaBeli)
-      await simpanBarangMasuk(p.id, Number(qty), harga)
+      await simpanBarangMasuk(p.id, Number(qty), harga, p.name || p.nama || '')
     } catch (err) {
       console.error('Gagal menyimpan barang masuk:', err)
       return notify('Gagal menyimpan barang masuk: ' + err.message)
@@ -805,7 +1191,7 @@ function Incoming({ products, setProducts, notify }) {
           </label>
           <label>
             Tanggal penerimaan
-            <input type="date" defaultValue="2026-11-05" />
+            <input type="date" defaultValue={new Date().toISOString().slice(0, 10)} />
           </label>
         </div>
         <label>
@@ -827,6 +1213,7 @@ function Opname({ products, setProducts, notify }) {
       .filter(p => physical[p.id] !== undefined && physical[p.id] !== '')
       .map(p => ({
         kode: p.id,
+        nama: p.name || p.nama || '',
         stokSistem: p.stock ?? p.stok ?? 0,
         stokFisik: Number(physical[p.id]),
       }))
@@ -915,45 +1302,389 @@ function Opname({ products, setProducts, notify }) {
   )
 }
 
-function Reports() {
+function Reports({ products, transactions, loading, notify }) {
+  const [period, setPeriod] = useState('bulanan')
+  const [selectedTrx, setSelectedTrx] = useState(null)
+
+  const productMap = useMemo(() => {
+    const map = new Map()
+    products.forEach(p => {
+      map.set(String(p.id), p)
+      if (p.kode) map.set(String(p.kode), p)
+    })
+    return map
+  }, [products])
+
+  const { filteredTrx, periodLabel } = useMemo(() => {
+    const now = new Date()
+    let start = new Date(now)
+    let end = new Date(now)
+    let label = ''
+
+    if (period === 'harian') {
+      start.setHours(0, 0, 0, 0)
+      end.setHours(23, 59, 59, 999)
+      label = new Intl.DateTimeFormat('id-ID', {
+        weekday: 'long',
+        day: 'numeric',
+        month: 'long',
+        year: 'numeric',
+      }).format(now)
+    } else if (period === 'mingguan') {
+      start.setDate(now.getDate() - 6)
+      start.setHours(0, 0, 0, 0)
+      end.setHours(23, 59, 59, 999)
+      const startStr = new Intl.DateTimeFormat('id-ID', { day: 'numeric', month: 'short' }).format(start)
+      const endStr = new Intl.DateTimeFormat('id-ID', { day: 'numeric', month: 'short', year: 'numeric' }).format(end)
+      label = `${startStr} – ${endStr}`
+    } else if (period === 'bulanan') {
+      start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
+      end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999)
+      label = new Intl.DateTimeFormat('id-ID', { month: 'long', year: 'numeric' }).format(now)
+    } else if (period === 'tahunan') {
+      start = new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0)
+      end = new Date(now.getFullYear(), 11, 31, 23, 59, 59, 999)
+      label = `Tahun ${now.getFullYear()}`
+    } else {
+      // 'semua'
+      start = new Date(0)
+      end = new Date(now.getTime() + 86400000 * 365)
+      label = 'Semua Transaksi'
+    }
+
+    const list = transactions.filter(t => {
+      const d = parseDate(t.waktu)
+      return d >= start && d <= end
+    })
+
+    return { filteredTrx: list, periodLabel: label, start, end }
+  }, [transactions, period])
+
+  const metrics = useMemo(() => {
+    let omzet = 0
+    let hpp = 0
+    let totalItemsSold = 0
+
+    filteredTrx.forEach(t => {
+      const m = getTransactionMetrics(t, productMap)
+      omzet += m.omzet
+      hpp += m.hpp
+      totalItemsSold += m.units
+    })
+
+    const profit = omzet - hpp
+    const hppPct = omzet > 0 ? (hpp / omzet) * 100 : 0
+    const marginPct = omzet > 0 ? (profit / omzet) * 100 : 0
+    const avgTrx = filteredTrx.length > 0 ? Math.round(omzet / filteredTrx.length) : 0
+
+    return {
+      omzet,
+      hpp,
+      profit,
+      hppPct: hppPct.toFixed(1).replace('.', ','),
+      marginPct: marginPct.toFixed(1).replace('.', ','),
+      avgTrx,
+      count: filteredTrx.length,
+      totalItemsSold,
+    }
+  }, [filteredTrx, productMap])
+
+  // Chart data buckets
+  const chartData = useMemo(() => {
+    if (period === 'harian') {
+      const buckets = [
+        { label: '06:00', shortLabel: '06:00', startH: 6, endH: 9, omzet: 0, profit: 0 },
+        { label: '09:00', shortLabel: '09:00', startH: 9, endH: 12, omzet: 0, profit: 0 },
+        { label: '12:00', shortLabel: '12:00', startH: 12, endH: 15, omzet: 0, profit: 0 },
+        { label: '15:00', shortLabel: '15:00', startH: 15, endH: 18, omzet: 0, profit: 0 },
+        { label: '18:00', shortLabel: '18:00', startH: 18, endH: 21, omzet: 0, profit: 0 },
+        { label: '21:00', shortLabel: '21:00', startH: 21, endH: 24, omzet: 0, profit: 0 },
+      ]
+      filteredTrx.forEach(t => {
+        const d = parseDate(t.waktu)
+        const h = d.getHours()
+        const m = getTransactionMetrics(t, productMap)
+        const bucket = buckets.find(b => h >= b.startH && h < b.endH) || buckets[buckets.length - 1]
+        bucket.omzet += m.omzet
+        bucket.profit += m.profit
+      })
+      return buckets
+    } else if (period === 'mingguan') {
+      const dayNames = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab']
+      const buckets = []
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date()
+        d.setDate(d.getDate() - i)
+        d.setHours(0, 0, 0, 0)
+        const endD = new Date(d)
+        endD.setHours(23, 59, 59, 999)
+        const dayTrx = filteredTrx.filter(t => {
+          const td = parseDate(t.waktu)
+          return td >= d && td <= endD
+        })
+        let omzet = 0,
+          profit = 0
+        dayTrx.forEach(t => {
+          const m = getTransactionMetrics(t, productMap)
+          omzet += m.omzet
+          profit += m.profit
+        })
+        buckets.push({
+          label: `${dayNames[d.getDay()]} (${d.getDate()}/${d.getMonth() + 1})`,
+          shortLabel: dayNames[d.getDay()],
+          omzet,
+          profit,
+        })
+      }
+      return buckets
+    } else if (period === 'bulanan') {
+      const now = new Date()
+      const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
+      const buckets = [
+        { label: 'Tgl 1-5', shortLabel: '1-5', start: 1, end: 5, omzet: 0, profit: 0 },
+        { label: 'Tgl 6-10', shortLabel: '6-10', start: 6, end: 10, omzet: 0, profit: 0 },
+        { label: 'Tgl 11-15', shortLabel: '11-15', start: 11, end: 15, omzet: 0, profit: 0 },
+        { label: 'Tgl 16-20', shortLabel: '16-20', start: 16, end: 20, omzet: 0, profit: 0 },
+        { label: 'Tgl 21-25', shortLabel: '21-25', start: 21, end: 25, omzet: 0, profit: 0 },
+        { label: `Tgl 26-${lastDay}`, shortLabel: `26-${lastDay}`, start: 26, end: lastDay, omzet: 0, profit: 0 },
+      ]
+      filteredTrx.forEach(t => {
+        const d = parseDate(t.waktu)
+        const dayNum = d.getDate()
+        const m = getTransactionMetrics(t, productMap)
+        const b = buckets.find(b => dayNum >= b.start && dayNum <= b.end) || buckets[buckets.length - 1]
+        b.omzet += m.omzet
+        b.profit += m.profit
+      })
+      return buckets
+    } else if (period === 'tahunan') {
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des']
+      const buckets = monthNames.map((name, idx) => ({
+        label: name,
+        shortLabel: name,
+        month: idx,
+        omzet: 0,
+        profit: 0,
+      }))
+      filteredTrx.forEach(t => {
+        const d = parseDate(t.waktu)
+        const mon = d.getMonth()
+        const m = getTransactionMetrics(t, productMap)
+        if (buckets[mon]) {
+          buckets[mon].omzet += m.omzet
+          buckets[mon].profit += m.profit
+        }
+      })
+      return buckets
+    } else {
+      // 'semua'
+      const map = new Map()
+      filteredTrx.forEach(t => {
+        const d = parseDate(t.waktu)
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+        const m = getTransactionMetrics(t, productMap)
+        const cur = map.get(key) || {
+          label: new Intl.DateTimeFormat('id-ID', { month: 'short', year: '2-digit' }).format(d),
+          shortLabel: new Intl.DateTimeFormat('id-ID', { month: 'short' }).format(d),
+          omzet: 0,
+          profit: 0,
+          time: d.getTime(),
+        }
+        cur.omzet += m.omzet
+        cur.profit += m.profit
+        map.set(key, cur)
+      })
+      const sorted = Array.from(map.values()).sort((a, b) => a.time - b.time)
+      return sorted.length ? sorted : [{ label: 'Belum ada', shortLabel: '-', omzet: 0, profit: 0 }]
+    }
+  }, [filteredTrx, period, productMap])
+
+  // SVG chart paths
+  const { omzetPath, profitPath, chartPoints, maxChartVal } = useMemo(() => {
+    const points = chartData || []
+    const maxVal = Math.max(...points.map(p => Math.max(p.omzet, p.profit)), 0)
+    const ceiling = maxVal > 0 ? maxVal * 1.15 : 1000000
+
+    const width = 600
+    const height = 180
+    const paddingX = 40
+    const paddingY = 25
+    const usableW = width - paddingX * 2
+    const usableH = height - paddingY * 2
+
+    const coords = points.map((p, i) => {
+      const x = points.length > 1 ? paddingX + (i / (points.length - 1)) * usableW : width / 2
+      const yOmzet = usableH + paddingY - (p.omzet / ceiling) * usableH
+      const yProfit = usableH + paddingY - (p.profit / ceiling) * usableH
+      return {
+        ...p,
+        x,
+        yOmzet,
+        yProfit,
+      }
+    })
+
+    const makePath = key => {
+      if (!coords.length) return ''
+      if (coords.length === 1) return `M ${coords[0].x - 30} ${coords[0][key]} L ${coords[0].x + 30} ${coords[0][key]}`
+      return coords.reduce((acc, pt, i) => {
+        if (i === 0) return `M ${pt.x} ${pt[key]}`
+        const prev = coords[i - 1]
+        const cpX1 = prev.x + (pt.x - prev.x) / 2
+        const cpY1 = prev[key]
+        const cpX2 = prev.x + (pt.x - prev.x) / 2
+        const cpY2 = pt[key]
+        return `${acc} C ${cpX1} ${cpY1}, ${cpX2} ${cpY2}, ${pt.x} ${pt[key]}`
+      }, '')
+    }
+
+    return {
+      omzetPath: makePath('yOmzet'),
+      profitPath: makePath('yProfit'),
+      chartPoints: coords,
+      maxChartVal: ceiling,
+    }
+  }, [chartData])
+
+  const downloadCSV = () => {
+    if (!filteredTrx.length) {
+      if (notify) notify('Tidak ada data transaksi pada periode ini untuk diunduh')
+      return
+    }
+
+    const csvRows = []
+    csvRows.push([
+      'No',
+      'No. Transaksi',
+      'Waktu',
+      'Kasir',
+      'Metode',
+      'Macam Barang',
+      'Total Unit',
+      'Rincian Barang',
+      'Total Omzet (Rp)',
+      'Total HPP (Rp)',
+      'Keuntungan Kotor (Rp)',
+    ])
+
+    filteredTrx.forEach((t, idx) => {
+      const d = parseDate(t.waktu)
+      const dateFormatted = new Intl.DateTimeFormat('id-ID', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }).format(d)
+      const m = getTransactionMetrics(t, productMap)
+      const itemsDetail = (t.items || [])
+        .map(i => `${i.nama || i.kode} (${i.qty}x @${i.hargaJual})`)
+        .join('; ')
+
+      csvRows.push([
+        idx + 1,
+        `#${t.id.slice(-6).toUpperCase()}`,
+        `"${dateFormatted}"`,
+        `"${t.kasir || 'Operator'}"`,
+        `"${t.metode || 'tunai'}"`,
+        m.kinds,
+        m.units,
+        `"${itemsDetail.replace(/"/g, '""')}"`,
+        m.omzet,
+        m.hpp,
+        m.profit,
+      ])
+    })
+
+    csvRows.push([])
+    csvRows.push([
+      '"TOTAL"',
+      '""',
+      '""',
+      '""',
+      '""',
+      '""',
+      metrics.totalItemsSold,
+      '""',
+      metrics.omzet,
+      metrics.hpp,
+      metrics.profit,
+    ])
+
+    const csvContent = csvRows.map(r => r.join(',')).join('\r\n')
+    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.setAttribute('href', url)
+    link.setAttribute('download', `laporan-keuangan-biber-${period}-${new Date().toISOString().slice(0, 10)}.csv`)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    URL.revokeObjectURL(url)
+    if (notify) notify('Laporan transaksi berhasil diunduh (CSV)')
+  }
+
   return (
     <section className="content">
       <div className="report-top">
         <div>
           <p className="eyebrow">PERIODE LAPORAN</p>
-          <h2>1 – 5 November 2026</h2>
+          <h2>{periodLabel}</h2>
         </div>
         <div className="period">
-          <button className="selected">Harian</button>
-          <button>Mingguan</button>
-          <button>Bulanan</button>
-          <button>Tahunan</button>
+          <button className={period === 'harian' ? 'selected' : ''} onClick={() => setPeriod('harian')}>
+            Harian
+          </button>
+          <button className={period === 'mingguan' ? 'selected' : ''} onClick={() => setPeriod('mingguan')}>
+            Mingguan
+          </button>
+          <button className={period === 'bulanan' ? 'selected' : ''} onClick={() => setPeriod('bulanan')}>
+            Bulanan
+          </button>
+          <button className={period === 'tahunan' ? 'selected' : ''} onClick={() => setPeriod('tahunan')}>
+            Tahunan
+          </button>
+          <button className={period === 'semua' ? 'selected' : ''} onClick={() => setPeriod('semua')}>
+            Semua
+          </button>
         </div>
       </div>
       <div className="stat-grid">
-        <Stat icon={<WalletCards />} label="Total omzet" value="Rp 5.827.000" delta="+12,5%" />
+        <Stat
+          icon={<WalletCards />}
+          label="Total omzet"
+          value={format(metrics.omzet)}
+          delta={`${metrics.count} transaksi`}
+        />
         <Stat
           icon={<PackageSearch />}
           label="Harga pokok penjualan"
-          value="Rp 2.256.400"
-          delta="38,7% dari omzet"
+          value={format(metrics.hpp)}
+          delta={`${metrics.hppPct}% dari omzet`}
           tone="blue"
         />
         <Stat
           icon={<TrendingUp />}
           label="Keuntungan kotor"
-          value="Rp 3.570.600"
-          delta="61,3% margin"
+          value={format(metrics.profit)}
+          delta={`${metrics.marginPct}% margin`}
           tone="purple"
         />
-        <Stat icon={<ReceiptText />} label="Transaksi" value="394" delta="Rata-rata Rp14.789" tone="orange" />
+        <Stat
+          icon={<ReceiptText />}
+          label="Transaksi"
+          value={String(metrics.count)}
+          delta={`Rata-rata ${format(metrics.avgTrx)}`}
+          tone="orange"
+        />
       </div>
       <div className="dashboard-grid report-grid">
         <div className="card revenue">
           <div className="card-head">
             <div>
               <h3>Omzet & keuntungan</h3>
-              <p>Perbandingan per hari</p>
+              <p>Perbandingan penjualan vs keuntungan kotor</p>
             </div>
             <div className="legend">
               <span />
@@ -963,29 +1694,47 @@ function Reports() {
             </div>
           </div>
           <div className="line-chart">
-            <svg viewBox="0 0 600 220" preserveAspectRatio="none">
-              <path
-                d="M0 170 C45 120,70 140,110 110 S180 138,220 95 S290 125,330 70 S400 100,450 50 S530 83,600 23"
-                fill="none"
-                stroke="#ed6b45"
-                strokeWidth="4"
-              />
-              <path
-                d="M0 190 C50 165,80 175,110 145 S180 170,220 135 S290 160,330 110 S400 140,450 92 S520 120,600 68"
-                fill="none"
-                stroke="#5f9c78"
-                strokeWidth="4"
-              />
+            <svg viewBox="0 0 600 200" preserveAspectRatio="none">
+              {[0.25, 0.5, 0.75].map(ratio => (
+                <line
+                  key={ratio}
+                  x1="30"
+                  y1={25 + (180 - 50) * ratio}
+                  x2="570"
+                  y2={25 + (180 - 50) * ratio}
+                  stroke="#eef0ed"
+                  strokeWidth="1"
+                  strokeDasharray="4 4"
+                />
+              ))}
+              <path d={omzetPath} fill="none" stroke="#ed6b45" strokeWidth="3.5" strokeLinecap="round" />
+              <path d={profitPath} fill="none" stroke="#5f9c78" strokeWidth="3.5" strokeLinecap="round" />
+              {chartPoints.map((pt, i) => (
+                <g key={i}>
+                  <circle cx={pt.x} cy={pt.yOmzet} r="4" fill="#ed6b45">
+                    <title>{`${pt.label}: Omzet ${format(pt.omzet)}`}</title>
+                  </circle>
+                  <circle cx={pt.x} cy={pt.yProfit} r="4" fill="#5f9c78">
+                    <title>{`${pt.label}: Keuntungan ${format(pt.profit)}`}</title>
+                  </circle>
+                  <text x={pt.x} y="195" textAnchor="middle" fontSize="10" fill="#88928b">
+                    {pt.shortLabel || pt.label}
+                  </text>
+                </g>
+              ))}
             </svg>
           </div>
         </div>
         <div className="card finance">
           <h3>Rincian keuangan</h3>
           {[
-            ['Penjualan kotor', 'Rp 5.827.000'],
+            ['Penjualan kotor', format(metrics.omzet)],
             ['Diskon transaksi', 'Rp 0'],
-            ['Harga pokok penjualan', '(Rp 2.256.400)'],
-            ['Keuntungan kotor', 'Rp 3.570.600'],
+            ['Harga pokok penjualan', `(${format(metrics.hpp)})`],
+            ['Keuntungan kotor', format(metrics.profit)],
+            ['Margin keuntungan', `${metrics.marginPct}%`],
+            ['Rata-rata transaksi', format(metrics.avgTrx)],
+            ['Total barang terjual', `${metrics.totalItemsSold} unit`],
           ].map((r, i) => (
             <div className={i === 3 ? 'finance-total' : ''} key={r[0]}>
               <span>{r[0]}</span>
@@ -998,9 +1747,11 @@ function Reports() {
         <div className="card-head">
           <div>
             <h3>Transaksi terbaru</h3>
-            <p>Rekap penjualan periode terpilih</p>
+            <p>Rekap penjualan periode terpilih ({filteredTrx.length} transaksi)</p>
           </div>
-          <button className="link">Unduh laporan</button>
+          <button className="link" onClick={downloadCSV}>
+            <Download size={15} style={{ verticalAlign: 'middle', marginRight: 4 }} /> Unduh laporan (CSV)
+          </button>
         </div>
         <table>
           <thead>
@@ -1011,28 +1762,159 @@ function Reports() {
               <th>ITEM</th>
               <th>METODE</th>
               <th>TOTAL</th>
+              <th>AKSI</th>
             </tr>
           </thead>
           <tbody>
-            {['086', '085', '084', '083'].map((n, i) => (
-              <tr key={n}>
-                <td>
-                  <b>#TRX-20261105-{n}</b>
-                </td>
-                <td>05 Nov 2026, {['10:34', '10:21', '10:15', '09:58'][i]}</td>
-                <td>Rani Aprillia</td>
-                <td>{[3, 2, 4, 1][i]} item</td>
-                <td>
-                  <span className="tag">Tunai</span>
-                </td>
-                <td>
-                  <b>{format([24000, 15000, 32000, 9000][i])}</b>
+            {filteredTrx.length === 0 ? (
+              <tr>
+                <td colSpan={7} style={{ textAlign: 'center', padding: 28, color: '#999' }}>
+                  Belum ada transaksi pada periode {periodLabel}
                 </td>
               </tr>
-            ))}
+            ) : (
+              filteredTrx.map(t => {
+                const date = parseDate(t.waktu)
+                const dateStr = new Intl.DateTimeFormat('id-ID', {
+                  day: 'numeric',
+                  month: 'short',
+                  year: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                }).format(date)
+                const m = getTransactionMetrics(t, productMap)
+                return (
+                  <tr key={t.id}>
+                    <td>
+                      <b>#{t.id.slice(-6).toUpperCase()}</b>
+                    </td>
+                    <td>{dateStr}</td>
+                    <td>
+                      <span className="tag">{t.kasir || 'Operator'}</span>
+                    </td>
+                    <td>
+                      {m.kinds} macam ({m.units} unit)
+                    </td>
+                    <td>
+                      <span className="status">{t.metode || 'tunai'}</span>
+                    </td>
+                    <td>
+                      <b>{format(t.total || 0)}</b>
+                    </td>
+                    <td>
+                      <button
+                        className="link"
+                        style={{ fontSize: 11, padding: '4px 8px', cursor: 'pointer' }}
+                        onClick={() => setSelectedTrx(t)}
+                      >
+                        Detail
+                      </button>
+                    </td>
+                  </tr>
+                )
+              })
+            )}
           </tbody>
         </table>
       </div>
+
+      {selectedTrx && (
+        <Modal
+          title={`Detail Transaksi #${selectedTrx.id.slice(-6).toUpperCase()}`}
+          close={() => setSelectedTrx(null)}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              marginBottom: 16,
+              fontSize: 12,
+              color: 'var(--muted)',
+              borderBottom: '1px solid var(--line)',
+              paddingBottom: 12,
+            }}
+          >
+            <div>
+              <div>
+                <b>Waktu: </b>
+                {new Intl.DateTimeFormat('id-ID', {
+                  dateStyle: 'full',
+                  timeStyle: 'medium',
+                }).format(parseDate(selectedTrx.waktu))}
+              </div>
+              <div>
+                <b>Kasir: </b>
+                {selectedTrx.kasir || 'Operator'}
+              </div>
+            </div>
+            <div style={{ textAlign: 'right' }}>
+              <div>
+                <b>Metode: </b>
+                <span className="status">{selectedTrx.metode || 'tunai'}</span>
+              </div>
+              <div>
+                <b>ID: </b>
+                <small>{selectedTrx.id}</small>
+              </div>
+            </div>
+          </div>
+          <div style={{ maxHeight: 220, overflowY: 'auto', marginBottom: 16 }}>
+            <table style={{ width: '100%', fontSize: 12 }}>
+              <thead>
+                <tr>
+                  <th>BARANG</th>
+                  <th style={{ textAlign: 'center' }}>QTY</th>
+                  <th style={{ textAlign: 'right' }}>HARGA</th>
+                  <th style={{ textAlign: 'right' }}>SUBTOTAL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(selectedTrx.items || []).map((it, i) => (
+                  <tr key={i}>
+                    <td>
+                      <b>{it.nama || it.kode}</b>
+                    </td>
+                    <td style={{ textAlign: 'center' }}>{it.qty}</td>
+                    <td style={{ textAlign: 'right' }}>{format(it.hargaJual || 0)}</td>
+                    <td style={{ textAlign: 'right' }}>
+                      <b>{format((it.hargaJual || 0) * (it.qty || 1))}</b>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="finance" style={{ background: '#fafbf9', padding: '12px 16px', borderRadius: 10 }}>
+            {(() => {
+              const m = getTransactionMetrics(selectedTrx, productMap)
+              return (
+                <>
+                  <div>
+                    <span>Total Belanja</span>
+                    <b>{format(m.omzet)}</b>
+                  </div>
+                  <div>
+                    <span>Harga Pokok (HPP)</span>
+                    <span>({format(m.hpp)})</span>
+                  </div>
+                  <div>
+                    <span>Keuntungan Kotor</span>
+                    <b style={{ color: 'var(--green)' }}>{format(m.profit)}</b>
+                  </div>
+                  <div>
+                    <span>Uang Diterima</span>
+                    <span>{format(selectedTrx.bayar ?? selectedTrx.total)}</span>
+                  </div>
+                  <div className="finance-total">
+                    <span>Kembalian</span>
+                    <b>{format(selectedTrx.kembalian ?? 0)}</b>
+                  </div>
+                </>
+              )
+            })()}
+          </div>
+        </Modal>
+      )}
     </section>
   )
 }
