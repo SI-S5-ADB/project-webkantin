@@ -1,77 +1,91 @@
 import { db } from './firebase'
-import { collection, doc, setDoc, writeBatch, increment, serverTimestamp } from 'firebase/firestore'
+import { collection, doc, runTransaction, increment, serverTimestamp } from 'firebase/firestore'
 
-function cekDb() {
+let sibuk = false
+
+// Semua penulisan lewat sini.
+// - Cek internet dulu (tanpa internet: langsung gagal, tidak diantre).
+// - Pakai transaksi Firestore: tidak diantre saat offline, jadi data tidak "muncul belakangan".
+// - Kunci anti klik ganda: simpan kedua ditolak selama simpan pertama masih berjalan.
+async function tulis(fn) {
   if (!db) throw new Error('Firebase belum terkonfigurasi')
+  if (!navigator.onLine) throw new Error('Tidak ada koneksi internet. Data belum disimpan.')
+  if (sibuk) throw new Error('Penyimpanan sebelumnya masih berjalan, tunggu sebentar.')
+  sibuk = true
+  try {
+    await runTransaction(db, fn)
+  } catch (err) {
+    if (err.code === 'unavailable' || /offline/i.test(err.message)) {
+      throw new Error('Koneksi internet bermasalah. Data belum disimpan.')
+    }
+    throw err
+  } finally {
+    sibuk = false
+  }
 }
 
-// Penjualan: simpan transaksi + kurangi stok tiap barang (satu batch: semua berhasil atau semua gagal)
+// Penjualan: cek stok cukup, simpan transaksi, kurangi stok (semua berhasil atau semua gagal)
 export async function simpanPenjualan(keranjang, bayar) {
-  cekDb()
-  const batch = writeBatch(db)
-  const trxRef = doc(collection(db, 'transaksi')) // ID otomatis
   const total = keranjang.reduce((s, i) => s + (i.sell ?? i.hargaJual ?? 0) * i.qty, 0)
+  const trxRef = doc(collection(db, 'transaksi'))
+  const refs = keranjang.map(i => doc(db, 'barang', i.id))
 
-  batch.set(trxRef, {
-    waktu: serverTimestamp(),
-    metode: 'tunai',
-    total,
-    bayar,
-    kembalian: bayar - total,
-    items: keranjang.map(i => ({
-      kode: i.id,
-      nama: i.name || i.nama || '',
-      qty: i.qty,
-      hargaJual: i.sell ?? i.hargaJual ?? 0,
-      hargaModal: i.buy ?? i.hargaModal ?? 0, // harga SAAT transaksi, untuk HPP aktual
-    })),
+  await tulis(async tx => {
+    const snaps = await Promise.all(refs.map(r => tx.get(r)))
+    snaps.forEach((snap, idx) => {
+      const i = keranjang[idx]
+      const stok = snap.exists() ? snap.data().stok ?? 0 : 0
+      if (stok < i.qty) throw new Error(`Stok ${i.name || i.nama} tidak cukup (sisa ${stok})`)
+    })
+
+    tx.set(trxRef, {
+      waktu: serverTimestamp(),
+      metode: 'tunai',
+      total,
+      bayar,
+      kembalian: bayar - total,
+      items: keranjang.map(i => ({
+        kode: i.id,
+        nama: i.name || i.nama || '',
+        qty: i.qty,
+        hargaJual: i.sell ?? i.hargaJual ?? 0,
+        hargaModal: i.buy ?? i.hargaModal ?? 0, // harga SAAT transaksi, untuk HPP aktual
+      })),
+    })
+    keranjang.forEach((i, idx) => tx.update(refs[idx], { stok: increment(-i.qty) }))
   })
-
-  for (const i of keranjang) {
-    batch.update(doc(db, 'barang', i.id), { stok: increment(-i.qty) })
-  }
-  await batch.commit()
 }
 
 // Barang masuk: tambah stok + catat riwayat
 export async function simpanBarangMasuk(kode, qty, hargaBeli) {
-  cekDb()
-  const batch = writeBatch(db)
-  batch.update(doc(db, 'barang', kode), { stok: increment(qty) })
-  batch.set(doc(collection(db, 'pergerakanStok')), {
-    kode,
-    jenis: 'masuk',
-    qty,
-    hargaBeli,
-    waktu: serverTimestamp(),
+  await tulis(async tx => {
+    tx.update(doc(db, 'barang', kode), { stok: increment(qty) })
+    tx.set(doc(collection(db, 'pergerakanStok')), {
+      kode, jenis: 'masuk', qty, hargaBeli, waktu: serverTimestamp(),
+    })
   })
-  await batch.commit()
 }
 
 // Stok opname: daftar = [{ kode, stokSistem, stokFisik }]
 export async function simpanOpname(daftar) {
-  cekDb()
-  const batch = writeBatch(db)
-  for (const d of daftar) {
-    batch.update(doc(db, 'barang', d.kode), { stok: d.stokFisik })
-    batch.set(doc(collection(db, 'pergerakanStok')), {
-      kode: d.kode,
-      jenis: 'opname',
-      qty: d.stokFisik - d.stokSistem,
-      stokSistem: d.stokSistem,
-      stokFisik: d.stokFisik,
-      waktu: serverTimestamp(),
-    })
-  }
-  await batch.commit()
+  await tulis(async tx => {
+    for (const d of daftar) {
+      tx.update(doc(db, 'barang', d.kode), { stok: d.stokFisik })
+      tx.set(doc(collection(db, 'pergerakanStok')), {
+        kode: d.kode,
+        jenis: 'opname',
+        qty: d.stokFisik - d.stokSistem,
+        stokSistem: d.stokSistem,
+        stokFisik: d.stokFisik,
+        waktu: serverTimestamp(),
+      })
+    }
+  })
 }
 
 // Tambah barang baru (Data Barang)
 export async function simpanBarangBaru(b) {
-  cekDb()
-  await setDoc(doc(db, 'barang', b.kode), {
-    ...b,
-    aktif: true,
-    createdAt: serverTimestamp(),
+  await tulis(async tx => {
+    tx.set(doc(db, 'barang', b.kode), { ...b, aktif: true, createdAt: serverTimestamp() })
   })
 }
