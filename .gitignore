@@ -3,9 +3,11 @@
 .env.local
 node_modules
 dist
+seed
 
 *.json
 !package.json
 !package-lock.json
 !firebase.json
 !firestore.indexes.json
+serviceAccountKey.json
