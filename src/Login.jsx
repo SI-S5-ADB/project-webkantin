@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { getAuth, signInWithEmailAndPassword } from 'firebase/auth'
+import { Eye, EyeOff } from 'lucide-react'
 
 const pesanError = code => {
   switch (code) {
@@ -25,6 +26,12 @@ const s = {
     boxShadow: '0 8px 30px rgba(0,0,0,.08)', display: 'grid', gap: 14, fontFamily: 'inherit',
   },
   input: { width: '100%', padding: '11px 12px', border: '1px solid #e5d5c5', borderRadius: 10, fontSize: 15, boxSizing: 'border-box' },
+  passwordWrapper: { position: 'relative', display: 'flex', alignItems: 'center', width: '100%' },
+  passwordInput: { width: '100%', padding: '11px 40px 11px 12px', border: '1px solid #e5d5c5', borderRadius: 10, fontSize: 15, boxSizing: 'border-box' },
+  eyeButton: {
+    position: 'absolute', right: 10, background: 'none', border: 'none', cursor: 'pointer',
+    padding: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#888',
+  },
   button: { padding: 12, border: 0, borderRadius: 10, background: '#d68c55', color: '#fff', fontSize: 16, fontWeight: 700, cursor: 'pointer' },
   error: { color: '#c0392b', fontSize: 14, margin: 0 },
 }
@@ -32,6 +39,7 @@ const s = {
 export default function Login() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -58,8 +66,24 @@ export default function Login() {
         </div>
         <input style={s.input} type="email" placeholder="Email" value={email}
           onChange={e => setEmail(e.target.value)} required autoFocus />
-        <input style={s.input} type="password" placeholder="Kata sandi" value={password}
-          onChange={e => setPassword(e.target.value)} required />
+        <div style={s.passwordWrapper}>
+          <input
+            style={s.passwordInput}
+            type={showPassword ? 'text' : 'password'}
+            placeholder="Kata sandi"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            required
+          />
+          <button
+            type="button"
+            style={s.eyeButton}
+            onClick={() => setShowPassword(v => !v)}
+            aria-label={showPassword ? 'Sembunyikan kata sandi' : 'Tampilkan kata sandi'}
+          >
+            {showPassword ? <EyeOff size={19} /> : <Eye size={19} />}
+          </button>
+        </div>
         {error && <p style={s.error}>{error}</p>}
         <button style={s.button} type="submit" disabled={loading}>
           {loading ? 'Memproses...' : 'Masuk'}
