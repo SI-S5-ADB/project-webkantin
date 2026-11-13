@@ -130,7 +130,7 @@ function App() {
 
   const notify = t => {
     setToast(t)
-    setTimeout(() => setToast(''), 2400)
+    setTimeout(() => setToast(''), 3500)
   }
 
   const access = item =>
@@ -293,7 +293,7 @@ function App() {
         {view === 'reports' && <Reports />}
       </main>
       {toast && (
-        <div className="toast">
+        <div className="toast" style={{ zIndex: 9999 }}>
           <Check size={18} />
           {toast}
         </div>

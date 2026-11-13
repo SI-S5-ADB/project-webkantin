@@ -10,4 +10,5 @@ seed
 !package-lock.json
 !firebase.json
 !firestore.indexes.json
-serviceAccountKey.json
+serviceAccountKey.js
+hapus.mjs
