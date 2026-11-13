@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { collection, getDocs, onSnapshot, orderBy, query } from 'firebase/firestore'
 import { db } from './firebase'
-import { getAuth, onAuthStateChanged, signOut } from 'firebase/auth'
+import { getAuth, onAuthStateChanged, signOut, updateProfile } from 'firebase/auth'
 import Login from './Login'
 import { simpanPenjualan, simpanBarangMasuk, simpanOpname, simpanBarangBaru } from './stokService'
 import {
@@ -33,6 +33,7 @@ import {
   ReceiptText,
   Download,
   Eye,
+  Pencil,
 } from 'lucide-react'
 import './style.css'
 
@@ -82,6 +83,21 @@ const formatRelativeTime = date => {
   if (diffDays === 1) return 'Kemarin'
   if (diffDays < 7) return `${diffDays} hari lalu`
   return new Intl.DateTimeFormat('id-ID', { day: 'numeric', month: 'short' }).format(date)
+}
+
+const getGreeting = () => {
+  const hour = new Date().getHours()
+  if (hour >= 4 && hour < 11) return 'Selamat pagi'
+  if (hour >= 11 && hour < 15) return 'Selamat siang'
+  if (hour >= 15 && hour < 18) return 'Selamat sore'
+  return 'Selamat malam'
+}
+
+const getInitials = name => {
+  if (!name || !name.trim()) return 'U'
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase()
+  return (parts[0][0] + parts[1][0]).toUpperCase()
 }
 
 const getTransactionMetrics = (t, productMap) => {
@@ -149,12 +165,26 @@ function App() {
     [authReady, setAuthReady] = useState(false),
     [transactions, setTransactions] = useState([]),
     [movements, setMovements] = useState([]),
-    [trxLoading, setTrxLoading] = useState(true)
+    [trxLoading, setTrxLoading] = useState(true),
+    [userName, setUserName] = useState(() => {
+      return localStorage.getItem('user_display_name') || 'Rani Aprillia'
+    }),
+    [showEditProfile, setShowEditProfile] = useState(false),
+    [tempName, setTempName] = useState('')
 
   useEffect(() => {
     const unsub = onAuthStateChanged(getAuth(), u => {
       setUser(u)
       setAuthReady(true)
+      if (u) {
+        const saved = localStorage.getItem('user_display_name')
+        if (saved) {
+          setUserName(saved)
+        } else if (u.displayName) {
+          setUserName(u.displayName)
+          localStorage.setItem('user_display_name', u.displayName)
+        }
+      }
     })
     return unsub
   }, [])
@@ -277,7 +307,7 @@ function App() {
   const complete = async paid => {
     if (!cart.length) return notify('Pilih barang terlebih dahulu')
     try {
-      await simpanPenjualan(cart, paid, role || user?.displayName || 'Operator')
+      await simpanPenjualan(cart, paid, userName || role || 'Operator')
     } catch (err) {
       console.error('Gagal menyimpan transaksi:', err)
       return notify('Gagal menyimpan transaksi: ' + err.message)
@@ -293,6 +323,22 @@ function App() {
     )
     setCart([])
     notify('Transaksi berhasil disimpan dan stok diperbarui')
+  }
+
+  const handleSaveProfileName = async () => {
+    const trimmed = tempName.trim()
+    if (!trimmed) return notify('Nama tidak boleh kosong')
+    setUserName(trimmed)
+    localStorage.setItem('user_display_name', trimmed)
+    if (user) {
+      try {
+        await updateProfile(user, { displayName: trimmed })
+      } catch (err) {
+        console.warn('Gagal update displayName di Firebase Auth:', err)
+      }
+    }
+    setShowEditProfile(false)
+    notify('Nama profil berhasil disimpan: ' + trimmed)
   }
 
   const todayTrxCount = useMemo(() => {
@@ -347,13 +393,23 @@ function App() {
           <button onClick={() => signOut(getAuth())}>
             <LogOut size={19} /> Keluar
           </button>
-          <div className="profile">
-            <div className="avatar">RA</div>
-            <div>
-              <b>Rani Aprillia</b>
+          <div
+            className="profile"
+            onClick={() => {
+              setTempName(userName)
+              setShowEditProfile(true)
+            }}
+            style={{ cursor: 'pointer', borderRadius: 10, padding: '6px 8px', transition: 'background 0.2s' }}
+            title="Klik untuk mengubah nama profil"
+          >
+            <div className="avatar">{getInitials(userName)}</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <b style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block' }}>
+                {userName}
+              </b>
               <span>{role}</span>
             </div>
-            <ChevronDown size={15} />
+            <Pencil size={14} style={{ color: 'var(--muted)', marginLeft: 'auto', flexShrink: 0 }} />
           </div>
         </div>
       </aside>
@@ -366,7 +422,11 @@ function App() {
             <p className="crumb">
               Biber Food & Drink <ChevronRight size={14} /> {nav.find(x => x.id === view)?.text}
             </p>
-            <h1>{view === 'dashboard' ? 'Selamat pagi, Rani! 👋' : nav.find(x => x.id === view)?.text}</h1>
+            <h1>
+              {view === 'dashboard'
+                ? `${getGreeting()}, ${userName}! 👋`
+                : nav.find(x => x.id === view)?.text}
+            </h1>
           </div>
           <div className="header-actions">
             <button className="date">
@@ -438,6 +498,43 @@ function App() {
           <Check size={18} />
           {toast}
         </div>
+      )}
+      {showEditProfile && (
+        <Modal title="Ubah Nama Profil" close={() => setShowEditProfile(false)}>
+          <form
+            onSubmit={e => {
+              e.preventDefault()
+              handleSaveProfileName()
+            }}
+          >
+            <label>
+              Nama Pengguna / Kasir
+              <input
+                type="text"
+                value={tempName}
+                onChange={e => setTempName(e.target.value)}
+                placeholder="Masukkan nama Anda..."
+                autoFocus
+                required
+              />
+            </label>
+            <p style={{ fontSize: 11, color: 'var(--muted)', margin: '8px 0 18px' }}>
+              Nama ini akan ditampilkan pada profil dan ucapan salam di Dashboard.
+            </p>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button
+                type="button"
+                onClick={() => setShowEditProfile(false)}
+                style={{ padding: '9px 15px', borderRadius: 8, border: '1px solid var(--line)', fontSize: 12, cursor: 'pointer' }}
+              >
+                Batal
+              </button>
+              <button type="submit" className="primary" style={{ padding: '9px 18px', fontSize: 12, cursor: 'pointer' }}>
+                Simpan
+              </button>
+            </div>
+          </form>
+        </Modal>
       )}
     </div>
   )
