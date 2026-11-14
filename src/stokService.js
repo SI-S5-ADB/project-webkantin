@@ -1,5 +1,9 @@
 import { db } from './firebase'
 import { collection, doc, runTransaction, increment, serverTimestamp } from 'firebase/firestore'
+import { getAuth } from 'firebase/auth'
+
+const pad = n => String(n).padStart(2, '0')
+const kunciHari = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
 
 let sibuk = false
 
@@ -25,10 +29,24 @@ async function tulis(fn) {
 }
 
 // Penjualan: cek stok cukup, simpan transaksi, kurangi stok (semua berhasil atau semua gagal)
-export async function simpanPenjualan(keranjang, bayar, kasir = 'Operator') {
+export async function simpanPenjualan(keranjang, bayar) {
   const total = keranjang.reduce((s, i) => s + (i.sell ?? i.hargaJual ?? 0) * i.qty, 0)
   const trxRef = doc(collection(db, 'transaksi'))
   const refs = keranjang.map(i => doc(db, 'barang', i.id))
+
+  // Ringkasan harian: Dashboard/Laporan cukup membaca dokumen ini (hemat kuota baca)
+  const sekarang = new Date()
+  const hppTotal = keranjang.reduce((s, i) => s + (i.buy ?? i.hargaModal ?? 0) * i.qty, 0)
+  const itemTotal = keranjang.reduce((s, i) => s + i.qty, 0)
+  const produk = {}
+  keranjang.forEach(i => {
+    produk[i.id] = {
+      nama: i.name || i.nama || '',
+      qty: increment(i.qty),
+      omzet: increment((i.sell ?? i.hargaJual ?? 0) * i.qty),
+    }
+  })
+  const ringkasanRef = doc(db, 'ringkasanHarian', kunciHari(sekarang))
 
   await tulis(async tx => {
     const snaps = await Promise.all(refs.map(r => tx.get(r)))
@@ -41,7 +59,7 @@ export async function simpanPenjualan(keranjang, bayar, kasir = 'Operator') {
     tx.set(trxRef, {
       waktu: serverTimestamp(),
       metode: 'tunai',
-      kasir: kasir || 'Operator',
+      kasir: getAuth().currentUser?.email || '',
       total,
       bayar,
       kembalian: bayar - total,
@@ -54,32 +72,39 @@ export async function simpanPenjualan(keranjang, bayar, kasir = 'Operator') {
       })),
     })
     keranjang.forEach((i, idx) => tx.update(refs[idx], { stok: increment(-i.qty) }))
+    tx.set(
+      ringkasanRef,
+      {
+        tanggal: kunciHari(sekarang),
+        omzet: increment(total),
+        hpp: increment(hppTotal),
+        transaksi: increment(1),
+        item: increment(itemTotal),
+        jam: { [pad(sekarang.getHours())]: { omzet: increment(total), hpp: increment(hppTotal) } },
+        produk,
+      },
+      { merge: true }
+    )
   })
 }
 
 // Barang masuk: tambah stok + catat riwayat
-export async function simpanBarangMasuk(kode, qty, hargaBeli, namaBarang = '') {
+export async function simpanBarangMasuk(kode, qty, hargaBeli) {
   await tulis(async tx => {
     tx.update(doc(db, 'barang', kode), { stok: increment(qty) })
     tx.set(doc(collection(db, 'pergerakanStok')), {
-      kode,
-      nama: namaBarang,
-      jenis: 'masuk',
-      qty,
-      hargaBeli,
-      waktu: serverTimestamp(),
+      kode, jenis: 'masuk', qty, hargaBeli, waktu: serverTimestamp(),
     })
   })
 }
 
-// Stok opname: daftar = [{ kode, nama, stokSistem, stokFisik }]
+// Stok opname: daftar = [{ kode, stokSistem, stokFisik }]
 export async function simpanOpname(daftar) {
   await tulis(async tx => {
     for (const d of daftar) {
       tx.update(doc(db, 'barang', d.kode), { stok: d.stokFisik })
       tx.set(doc(collection(db, 'pergerakanStok')), {
         kode: d.kode,
-        nama: d.nama || '',
         jenis: 'opname',
         qty: d.stokFisik - d.stokSistem,
         stokSistem: d.stokSistem,
